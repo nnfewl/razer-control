@@ -208,11 +208,12 @@ jobs:
       - name: Package tarball
         run: |
           DIST="razer-control-${APP_VERSION}-x86_64"
-          mkdir -p $DIST/bin $DIST/share/applications $DIST/share/razercontrol $DIST/systemd $DIST/udev
+          mkdir -p $DIST/bin $DIST/share/applications $DIST/share/razercontrol $DIST/share/icons/hicolor/scalable/apps $DIST/systemd $DIST/udev
           cp razer_control_gui/target/release/razer-settings $DIST/bin/
           cp razer_control_gui/target/release/razer-cli $DIST/bin/
           cp razer_control_gui/target/release/daemon $DIST/bin/
           cp razer_control_gui/data/gui/com.encomjp.razer-settings.desktop $DIST/share/applications/
+          cp razer_control_gui/data/gui/com.github.encomjp.razercontrol.svg $DIST/share/icons/hicolor/scalable/apps/
           cp razer_control_gui/data/devices/laptops.json $DIST/share/razercontrol/
           cp razer_control_gui/data/services/systemd/razercontrol.service $DIST/systemd/
           cp razer_control_gui/data/udev/99-hidraw-permissions.rules $DIST/udev/

@@ -1,5 +1,5 @@
 # Maintainer: nnfewl <nnfewl@users.noreply.github.com>
-pkgname=razer-control
+pkgname=razer-control-bin
 pkgver=0.3.0rc5
 pkgrel=1
 pkgdesc="Razer laptop control for Linux — fan, power, RGB, battery health. No kernel modules required."
@@ -7,45 +7,29 @@ arch=('x86_64')
 url="https://github.com/nnfewl/razer-control-revived"
 license=('GPL2')
 depends=('dbus' 'hidapi' 'gtk4' 'libadwaita' 'libusb')
-makedepends=('rust' 'cargo' 'pkgconf')
-source=("$pkgname-$pkgver.tar.gz::https://github.com/nnfewl/razer-control-revived/archive/refs/tags/v${pkgver/rc/-rc}.tar.gz")
+provides=('razer-control')
+conflicts=('razer-control')
+source=("razer-control-${pkgver/rc/-rc}-x86_64.tar.gz::https://github.com/nnfewl/razer-control-revived/releases/download/v${pkgver/rc/-rc}/razer-control-${pkgver/rc/-rc}-x86_64.tar.gz")
 sha256sums=('SKIP')
 
-prepare() {
-    cd "razer-control-revived-${pkgver/rc/-rc}"
-    # Ensure Cargo uses offline vendored deps if available, else fetch
-    export CARGO_HOME="$srcdir/cargo-home"
-}
-
-build() {
-    cd "razer-control-revived-${pkgver/rc/-rc}/razer_control_gui"
-    export CARGO_HOME="$srcdir/cargo-home"
-    cargo build --release
-}
-
 package() {
-    cd "razer-control-revived-${pkgver/rc/-rc}/razer_control_gui"
+    cd "razer-control-${pkgver/rc/-rc}-x86_64"
 
-    # Binaries
-    install -Dm755 target/release/razer-settings  "$pkgdir/usr/bin/razer-settings"
-    install -Dm755 target/release/razer-cli        "$pkgdir/usr/bin/razer-cli"
-    install -Dm755 target/release/daemon           "$pkgdir/usr/bin/razer-daemon"
+    install -Dm755 bin/razer-settings  "$pkgdir/usr/bin/razer-settings"
+    install -Dm755 bin/razer-cli        "$pkgdir/usr/bin/razer-cli"
+    install -Dm755 bin/daemon           "$pkgdir/usr/bin/razer-daemon"
 
-    # Device database
-    install -Dm644 data/devices/laptops.json \
+    install -Dm644 share/razercontrol/laptops.json \
         "$pkgdir/usr/share/razercontrol/laptops.json"
 
-    # Desktop entry and icon
-    install -Dm644 data/gui/com.encomjp.razer-settings.desktop \
+    install -Dm644 share/applications/com.encomjp.razer-settings.desktop \
         "$pkgdir/usr/share/applications/com.encomjp.razer-settings.desktop"
-    install -Dm644 data/gui/com.github.encomjp.razercontrol.svg \
+    install -Dm644 share/icons/hicolor/scalable/apps/com.github.encomjp.razercontrol.svg \
         "$pkgdir/usr/share/icons/hicolor/scalable/apps/com.github.encomjp.razercontrol.svg"
 
-    # Systemd user service
-    install -Dm644 data/services/systemd/razercontrol.service \
+    install -Dm644 systemd/razercontrol.service \
         "$pkgdir/usr/lib/systemd/user/razercontrol.service"
 
-    # udev rules
-    install -Dm644 data/udev/99-hidraw-permissions.rules \
+    install -Dm644 udev/99-hidraw-permissions.rules \
         "$pkgdir/etc/udev/rules.d/99-hidraw-permissions.rules"
 }
