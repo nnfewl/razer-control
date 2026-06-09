@@ -1869,7 +1869,7 @@ fn make_about_page(device: SupportedDevice) -> SettingsPage {
     section.add_row(&row.row);
 
     let url = gtk::LinkButton::with_label(
-        "https://github.com/encomjp/razer-control-revived",
+        "https://github.com/nnfewl/razer-control-revived",
         "View on GitHub",
     );
     let row = SettingsRow::new("Repository", &url);
@@ -1897,7 +1897,7 @@ fn make_about_page(device: SupportedDevice) -> SettingsPage {
         glib::timeout_add_local_once(Duration::from_millis(100), move || {
             let current = env!("CARGO_PKG_VERSION");
             let msg = match std::process::Command::new("curl")
-                .args(["-sf", "--max-time", "10", "https://api.github.com/repos/encomjp/razer-control-revived/releases/latest"])
+                .args(["-sf", "--max-time", "10", "https://api.github.com/repos/nnfewl/razer-control-revived/releases/latest"])
                 .output()
             {
                 Ok(output) => {
