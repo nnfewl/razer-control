@@ -3,3 +3,13 @@ razer_control_gui/target/
 
 # Release binaries (use GitHub Releases, not the repo)
 *.rpm
+*.deb
+*.pkg.tar.zst
+
+# makepkg build artifacts (packaging/arch)
+packaging/arch/pkg/
+packaging/arch/src/
+packaging/arch/*.tar.gz
+
+# Local session notes
+SESSION_REPORT.md
