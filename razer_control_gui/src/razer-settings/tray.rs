@@ -188,20 +188,36 @@ pub fn start_background_polling(
 
             // One daemon round-trip for both values — the socket protocol is
             // one command per connection
-            let status = crate::comms::try_bind()
-                .ok()
-                .and_then(|socket| crate::comms::send_to_daemon(
-                    crate::comms::DaemonCommand::GetFanSpeedAndLogo { ac: ac_idx },
-                    socket,
-                ))
+            let status = query_daemon(crate::comms::DaemonCommand::GetFanSpeedAndLogo { ac: ac_idx })
                 .and_then(|resp| match resp {
                     crate::comms::DaemonResponse::GetFanSpeedAndLogo { rpm, logo_state } =>
                         Some((rpm, logo_state)),
                     _ => None,
                 });
 
-            let fan_speed = status.map(|(rpm, _)| rpm);
-            let logo_state = if has_logo { status.map(|(_, logo)| logo) } else { None };
+            let (fan_speed, logo_state) = match status {
+                Some((rpm, logo)) => (Some(rpm), if has_logo { Some(logo) } else { None }),
+                // Daemons older than the combined command don't answer it —
+                // fall back to the legacy per-value commands so a version-skewed
+                // daemon (e.g. not yet restarted after an upgrade) keeps working
+                None => {
+                    let fan = query_daemon(crate::comms::DaemonCommand::GetFanSpeed { ac: ac_idx })
+                        .and_then(|resp| match resp {
+                            crate::comms::DaemonResponse::GetFanSpeed { rpm } => Some(rpm),
+                            _ => None,
+                        });
+                    let logo = if has_logo {
+                        query_daemon(crate::comms::DaemonCommand::GetLogoLedState { ac: ac_idx })
+                            .and_then(|resp| match resp {
+                                crate::comms::DaemonResponse::GetLogoLedState { logo_state } => Some(logo_state),
+                                _ => None,
+                            })
+                    } else {
+                        None
+                    };
+                    (fan, logo)
+                }
+            };
 
             if let Ok(mut s) = state.lock() {
                 let (fan_min, fan_max) = (s.fan_min, s.fan_max);
@@ -274,6 +290,15 @@ fn device_info(devices: &[service::SupportedDevice], name: &str) -> Option<(i32,
     let fan_min = device.fan.first().map(|&v| v as i32).unwrap_or(3500);
     let fan_max = device.fan.get(1).map(|&v| v as i32).unwrap_or(5000);
     Some((fan_min, fan_max, device.has_logo()))
+}
+
+/// One request/response round-trip; the socket protocol is one command per
+/// connection. `None` when the daemon is unreachable or does not understand
+/// the command (older protocol version).
+fn query_daemon(cmd: crate::comms::DaemonCommand) -> Option<crate::comms::DaemonResponse> {
+    crate::comms::try_bind()
+        .ok()
+        .and_then(|socket| crate::comms::send_to_daemon(cmd, socket))
 }
 
 /// True when the daemon acknowledged a Set command — the tray must not
