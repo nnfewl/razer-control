@@ -257,11 +257,17 @@ pub fn start_background_polling(
 
 /// Returns `None` if the daemon is not reachable, the device capabilities on success.
 fn try_get_device_info_from_daemon() -> Option<DeviceCaps> {
-    let name = crate::comms::try_bind()
-        .ok()
-        .and_then(|socket| crate::comms::send_to_daemon(
-            crate::comms::DaemonCommand::GetDeviceName, socket,
-        ))
+    // Preferred: the daemon serves its own parsed laptops.json entry, so the
+    // tray cannot drift from the daemon's view of the device
+    if let Some(crate::comms::DaemonResponse::GetDeviceCapabilities { features, fan, .. }) =
+        query_daemon(crate::comms::DaemonCommand::GetDeviceCapabilities)
+    {
+        return Some(caps_from_parts(&features, &fan));
+    }
+
+    // Fallback for daemons predating GetDeviceCapabilities: ask for the
+    // device name and look it up in the local laptops.json copy
+    let name = query_daemon(crate::comms::DaemonCommand::GetDeviceName)
         .and_then(|resp| match resp {
             crate::comms::DaemonResponse::GetDeviceName { name } => Some(name),
             _ => None,
@@ -294,16 +300,21 @@ fn parse_dgpu_stats(output: &str) -> (Option<f64>, Option<f64>, Option<u32>) {
     (temp, power, util)
 }
 
+/// Capabilities from a device entry's feature tags and fan range.
+fn caps_from_parts(features: &[String], fan: &[u16]) -> DeviceCaps {
+    DeviceCaps {
+        fan_min: fan.first().map(|&v| v as i32).unwrap_or(DEFAULT_FAN_MIN),
+        fan_max: fan.get(1).map(|&v| v as i32).unwrap_or(DEFAULT_FAN_MAX),
+        has_logo: features.iter().any(|f| f == "logo"),
+    }
+}
+
 /// Fan range and logo capability for `name` from the parsed device list.
 /// `None` when the device is not in the list — the caller decides the
 /// fallback (and should log the miss).
 fn device_info(devices: &[service::SupportedDevice], name: &str) -> Option<DeviceCaps> {
     let device = devices.iter().find(|d| d.name == name)?;
-    Some(DeviceCaps {
-        fan_min: device.fan.first().map(|&v| v as i32).unwrap_or(DEFAULT_FAN_MIN),
-        fan_max: device.fan.get(1).map(|&v| v as i32).unwrap_or(DEFAULT_FAN_MAX),
-        has_logo: device.has_logo(),
-    })
+    Some(caps_from_parts(&device.features, &device.fan))
 }
 
 /// One request/response round-trip; the socket protocol is one command per

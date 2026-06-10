@@ -267,6 +267,17 @@ impl DeviceManager {
             .map_or_else(|| "Unknown Device".to_string(), |d| d.get_name())
     }
 
+    /// The active device's laptops.json entry: (name, features, fan range).
+    /// Empty features/fan when no supported device is connected.
+    pub fn device_capabilities(&self) -> (String, Vec<String>, Vec<u16>) {
+        self.device
+            .as_ref()
+            .map_or_else(
+                || ("Unknown Device".to_string(), vec![], vec![]),
+                |d| d.capabilities(),
+            )
+    }
+
     pub fn restore_standard_effect(&mut self) {
         let mut effect = 0;
         let mut params: Vec<u8> = vec![];
@@ -826,6 +837,11 @@ impl RazerLaptop {
 
     pub fn get_name(&self) -> String {
         return self.name.clone();
+    }
+
+    /// The device's laptops.json entry data: (name, features, fan range)
+    pub fn capabilities(&self) -> (String, Vec<String>, Vec<u16>) {
+        (self.name.clone(), self.features.clone(), self.fan.clone())
     }
 
     pub fn have_feature(&mut self, fch: String) -> bool {

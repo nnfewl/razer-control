@@ -57,6 +57,7 @@ pub enum DaemonCommand {
     SetGpuMode { mode: String },
     ProbeBatteryHealthOptimizer,
     GetFanSpeedAndLogo { ac: usize },          // Combined tray poll: one round-trip
+    GetDeviceCapabilities,                     // Active device's laptops.json entry
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -102,6 +103,7 @@ pub enum DaemonResponse {
         threshold: u8,
     },
     GetFanSpeedAndLogo { rpm: i32, logo_state: u8 },
+    GetDeviceCapabilities { name: String, features: Vec<String>, fan: Vec<u16> },
 }
 
 #[allow(dead_code)]
@@ -228,6 +230,16 @@ mod tests {
     fn fan_and_logo_status_roundtrips_through_bincode() {
         roundtrip_cmd(DaemonCommand::GetFanSpeedAndLogo { ac: 1 });
         roundtrip_resp(DaemonResponse::GetFanSpeedAndLogo { rpm: 4300, logo_state: 2 });
+    }
+
+    #[test]
+    fn device_capabilities_roundtrips_through_bincode() {
+        roundtrip_cmd(DaemonCommand::GetDeviceCapabilities);
+        roundtrip_resp(DaemonResponse::GetDeviceCapabilities {
+            name: "Blade 15".into(),
+            features: vec!["fan".into(), "logo".into()],
+            fan: vec![3200, 5200],
+        });
     }
 
     #[test]
