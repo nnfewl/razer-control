@@ -17,7 +17,6 @@ button:hover {
 /* System monitor status bar — subtle top border */
 .monitor-bar {
     padding: 4px 0;
-    border-top: 1px solid alpha(currentColor, 0.08);
 }
 
 /* AC/Battery toggle — slightly bolder when selected */

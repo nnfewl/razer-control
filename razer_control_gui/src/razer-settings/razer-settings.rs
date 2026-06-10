@@ -902,6 +902,9 @@ fn main() {
                 Err(e) => eprintln!("Tray error (non-fatal): {}", e),
             }
         }
+
+        // Background sensor polling — keeps tray tooltip data fresh even if window never opened
+        tray::start_background_polling(Arc::clone(&tray_state));
     });
 
     let shared_state_for_activate = Arc::clone(&shared_state);
@@ -1014,7 +1017,7 @@ fn main() {
         let page = view_stack.add_titled(&about_page.page, Some("About"), "About");
         page.set_icon_name(Some("help-about-symbolic"));
 
-        // Separator + status bar at bottom
+
         let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
         content_box.append(&separator);
         let monitor = create_system_monitor(Arc::clone(&shared_state_for_activate));

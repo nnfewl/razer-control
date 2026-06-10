@@ -1,7 +1,8 @@
 use std::fs;
 use std::sync::{Arc, Mutex};
+use serde_json;
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct SensorState {
     pub cpu_temp: Option<f64>,
     pub igpu_temp: Option<f64>,
@@ -17,6 +18,21 @@ pub struct SensorState {
     pub igpu_util: Option<u32>,
     pub dgpu_power: Option<f64>,
     pub dgpu_util: Option<u32>,
+    pub fan_min: i32,
+    pub fan_max: i32,
+}
+
+impl Default for SensorState {
+    fn default() -> Self {
+        SensorState {
+            cpu_temp: None, igpu_temp: None, dgpu_temp: None,
+            fan_speed: None, on_ac: None, battery_pct: None,
+            battery_status: None, battery_power: None, system_power: None,
+            cpu_util: None, igpu_power: None, igpu_util: None,
+            dgpu_power: None, dgpu_util: None,
+            fan_min: 3500, fan_max: 5000,
+        }
+    }
 }
 
 impl SensorState {
@@ -37,6 +53,8 @@ impl SensorState {
             igpu_util: read_igpu_util(),
             dgpu_power: read_dgpu_power(),
             dgpu_util: read_dgpu_util(),
+            fan_min: 3500,
+            fan_max: 5000,
         }
     }
 
@@ -134,6 +152,77 @@ pub fn new_shared_state() -> SharedSensorState {
     Arc::new(Mutex::new(SensorState::default()))
 }
 
+fn get_fan_range_from_daemon() -> (i32, i32) {
+    let name = crate::comms::try_bind()
+        .ok()
+        .and_then(|socket| crate::comms::send_to_daemon(
+            crate::comms::DaemonCommand::GetDeviceName, socket,
+        ))
+        .and_then(|resp| match resp {
+            crate::comms::DaemonResponse::GetDeviceName { name } => Some(name),
+            _ => None,
+        });
+
+    let name = match name {
+        Some(n) => n,
+        None => return (3500, 5000),
+    };
+
+    let path = std::env::var("RAZER_DEVICE_FILE")
+        .unwrap_or_else(|_| "/usr/share/razercontrol/laptops.json".into());
+    let json = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return (3500, 5000),
+    };
+    let devices: Vec<serde_json::Value> = match serde_json::from_str(&json) {
+        Ok(v) => v,
+        Err(_) => return (3500, 5000),
+    };
+
+    for device in devices {
+        if device["name"].as_str() == Some(&name) {
+            if let Some(fan) = device["fan"].as_array() {
+                let min = fan.first().and_then(|v| v.as_i64()).unwrap_or(3500) as i32;
+                let max = fan.get(1).and_then(|v| v.as_i64()).unwrap_or(5000) as i32;
+                return (min, max);
+            }
+        }
+    }
+    (3500, 5000)
+}
+
+pub fn start_background_polling(state: SharedSensorState) {
+    std::thread::spawn(move || {
+        let (fan_min, fan_max) = get_fan_range_from_daemon();
+        if let Ok(mut s) = state.lock() {
+            s.fan_min = fan_min;
+            s.fan_max = fan_max;
+        }
+
+        loop {
+            let fresh = SensorState::read_fresh();
+            let ac = fresh.on_ac.unwrap_or(true);
+            let fan_speed = crate::comms::try_bind()
+                .ok()
+                .and_then(|socket| crate::comms::send_to_daemon(
+                    crate::comms::DaemonCommand::GetFanSpeed { ac: if ac { 1 } else { 0 } },
+                    socket,
+                ))
+                .and_then(|resp| match resp {
+                    crate::comms::DaemonResponse::GetFanSpeed { rpm } => Some(rpm),
+                    _ => None,
+                });
+
+            if let Ok(mut s) = state.lock() {
+                let (fan_min, fan_max) = (s.fan_min, s.fan_max);
+                *s = SensorState { fan_speed, fan_min, fan_max, ..fresh };
+            }
+
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+    });
+}
+
 pub struct RazerTray {
     state: SharedSensorState,
 }
@@ -154,7 +243,7 @@ impl ksni::Tray for RazerTray {
     }
 
     fn icon_name(&self) -> String {
-        "com.github.encomjp.razercontrol".into()
+        "com.github.encomjp.razercontrol-symbolic".into()
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {
@@ -179,34 +268,116 @@ impl ksni::Tray for RazerTray {
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
-        vec![
+        let state = self.state.lock().ok().map(|s| s.clone()).unwrap_or_default();
+        let current_rpm = state.fan_speed.unwrap_or(0);
+        let on_ac = state.on_ac.unwrap_or(true);
+        let fan_min = state.fan_min;
+        let fan_max = state.fan_max;
+        let range = fan_max - fan_min;
+
+        let presets: [(i32, &str); 6] = [
+            (0,                        "Auto"),
+            (fan_min,                  "Min"),
+            (fan_min + range / 4,      "25%"),
+            (fan_min + range / 2,      "50%"),
+            (fan_min + range * 3 / 4,  "75%"),
+            (fan_max,                  "Max"),
+        ];
+
+        let selected = presets.iter().enumerate()
+            .min_by_key(|(_, (rpm, _))| {
+                if *rpm == 0 && current_rpm == 0 { 0 }
+                else if *rpm == 0 { i32::MAX }
+                else { (current_rpm - rpm).abs() }
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        let current_preset = presets.get(selected).map(|(_, l)| *l).unwrap_or("Auto");
+        let fan_submenu_label = format!("Fan Speed  ·  {}", current_preset);
+
+        // Status lines
+        let cpu_line = match (state.cpu_temp, state.cpu_util) {
+            (Some(t), Some(u)) => Some(format!("CPU  {:.0}°C · {}%", t, u)),
+            (Some(t), None)    => Some(format!("CPU  {:.0}°C", t)),
+            _ => None,
+        };
+        let bat_line = match (state.battery_pct, state.on_ac, state.battery_status.as_deref(), state.battery_power) {
+            (Some(pct), Some(true), Some("Charging"), Some(w)) =>
+                Some(format!("Battery  {}%  ·  AC +{:.0}W", pct, w)),
+            (Some(pct), Some(true), _, _) =>
+                Some(format!("Battery  {}%  ·  AC", pct)),
+            (Some(pct), Some(false), _, Some(w)) =>
+                Some(format!("Battery  {}%  ·  −{:.0}W", pct, w)),
+            (Some(pct), Some(false), _, _) =>
+                Some(format!("Battery  {}%", pct)),
+            _ => None,
+        };
+
+        let mut items: Vec<ksni::MenuItem<Self>> = vec![
+            // Primary action — first
             ksni::MenuItem::Standard(ksni::menu::StandardItem {
                 label: "Open Razer Control".into(),
                 activate: Box::new(|_| {
-                    // Use GApplication activation via command line — this sends
-                    // an "activate" signal to the already-running primary instance
-                    // rather than spawning a duplicate process with a second tray.
                     let _ = std::process::Command::new("gdbus")
-                        .args([
-                            "call", "--session",
+                        .args(["call", "--session",
                             "--dest", "com.encomjp.razer-settings",
                             "--object-path", "/com/encomjp/razer_settings",
-                            "--method", "org.gtk.Application.Activate",
-                            "[]",
-                        ])
+                            "--method", "org.gtk.Application.Activate", "[]"])
                         .spawn();
                 }),
                 ..Default::default()
             }),
             ksni::MenuItem::Separator,
-            ksni::MenuItem::Standard(ksni::menu::StandardItem {
-                label: "Quit".into(),
-                activate: Box::new(|_| {
-                    std::process::exit(0);
-                }),
+            // Fan control submenu
+            ksni::MenuItem::SubMenu(ksni::menu::SubMenu {
+                label: fan_submenu_label,
+                submenu: presets.iter().enumerate().map(|(i, (rpm, label))| {
+                    let rpm = *rpm;
+                    let display = if rpm == 0 { label.to_string() } else { format!("{} ({} RPM)", label, rpm) };
+                    ksni::MenuItem::Checkmark(ksni::menu::CheckmarkItem {
+                        label: display,
+                        checked: i == selected,
+                        activate: Box::new(move |tray: &mut RazerTray| {
+                            let ac = if on_ac { 1 } else { 0 };
+                            let _ = crate::comms::try_bind()
+                                .ok()
+                                .and_then(|socket| crate::comms::send_to_daemon(
+                                    crate::comms::DaemonCommand::SetFanSpeed { ac, rpm },
+                                    socket,
+                                ));
+                            if let Ok(mut s) = tray.state.lock() {
+                                s.fan_speed = Some(rpm);
+                            }
+                        }),
+                        ..Default::default()
+                    })
+                }).collect(),
                 ..Default::default()
             }),
-        ]
+            ksni::MenuItem::Separator,
+        ];
+
+        // Status section
+        if let Some(line) = cpu_line {
+            items.push(ksni::MenuItem::Standard(ksni::menu::StandardItem {
+                label: line, enabled: false, ..Default::default()
+            }));
+        }
+        if let Some(line) = bat_line {
+            items.push(ksni::MenuItem::Standard(ksni::menu::StandardItem {
+                label: line, enabled: false, ..Default::default()
+            }));
+        }
+
+        items.push(ksni::MenuItem::Separator);
+        items.push(ksni::MenuItem::Standard(ksni::menu::StandardItem {
+            label: "Quit".into(),
+            activate: Box::new(|_| std::process::exit(0)),
+            ..Default::default()
+        }));
+
+        items
     }
 }
 
