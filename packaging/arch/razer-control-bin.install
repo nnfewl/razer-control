@@ -1,0 +1,30 @@
+post_install() {
+    udevadm control --reload-rules
+    udevadm trigger
+
+    local user="${SUDO_USER:-}"
+    if [ -n "$user" ] && id "$user" &>/dev/null; then
+        su -c "systemctl --user daemon-reload && systemctl --user enable --now razercontrol.service" "$user" || true
+    else
+        echo ">>> Run as your user: systemctl --user enable --now razercontrol.service"
+    fi
+}
+
+post_upgrade() {
+    udevadm control --reload-rules
+    udevadm trigger
+
+    local user="${SUDO_USER:-}"
+    if [ -n "$user" ] && id "$user" &>/dev/null; then
+        su -c "systemctl --user daemon-reload && systemctl --user restart razercontrol.service" "$user" || true
+    else
+        echo ">>> Run as your user: systemctl --user restart razercontrol.service"
+    fi
+}
+
+pre_remove() {
+    local user="${SUDO_USER:-}"
+    if [ -n "$user" ] && id "$user" &>/dev/null; then
+        su -c "systemctl --user disable --now razercontrol.service" "$user" || true
+    fi
+}
