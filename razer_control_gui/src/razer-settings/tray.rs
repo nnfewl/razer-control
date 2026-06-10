@@ -267,6 +267,62 @@ fn try_get_device_info_from_daemon() -> Option<(i32, i32, bool)> {
     Some((3500, 5000, false)) // device found but no entry — use defaults
 }
 
+// --- Pure tray-menu logic (unit-tested below) ---
+
+/// Logo LED states as encoded in the daemon protocol: 0=Off, 1=On, 2=Breathing
+const LOGO_LABELS: [&str; 3] = ["Off", "On", "Breathing"];
+
+/// Five fan presets derived from the device fan range. RPMs snap to the
+/// nearest 100 to match hardware granularity (clamp_fan divides by 100).
+fn fan_presets(fan_min: i32, fan_max: i32) -> [(i32, &'static str); 5] {
+    let range = fan_max - fan_min;
+    let pct_rpm = |p: f64| -> i32 {
+        ((fan_min as f64 + range as f64 * p) / 100.0).round() as i32 * 100
+    };
+    [
+        (0,             "Auto"),
+        (pct_rpm(0.25), "Low"),
+        (pct_rpm(0.50), "Medium"),
+        (pct_rpm(0.75), "High"),
+        (fan_max,       "Max"),
+    ]
+}
+
+/// Exact match only — no fuzzy nearest-preset selection
+fn selected_preset_index(presets: &[(i32, &'static str)], current_rpm: i32) -> Option<usize> {
+    presets.iter().position(|(rpm, _)| *rpm == current_rpm)
+}
+
+/// Preset label on exact match, otherwise the fan position as a percentage
+/// of the device range ("Auto" for non-positive RPM).
+fn fan_current_label(
+    presets: &[(i32, &'static str)],
+    selected: Option<usize>,
+    current_rpm: i32,
+    fan_min: i32,
+    fan_max: i32,
+) -> String {
+    match selected {
+        Some(i) => presets[i].1.to_string(),
+        None if current_rpm <= 0 => "Auto".to_string(),
+        None => {
+            let range = fan_max - fan_min;
+            let pct = if range > 0 {
+                ((current_rpm - fan_min) as f64 / range as f64 * 100.0).round() as i32
+            } else { 0 };
+            format!("{}%", pct.clamp(0, 100))
+        }
+    }
+}
+
+/// Label for the current logo state; unknown or out-of-range states fall
+/// back to "On" (see REVIEW_FINDINGS.md #3).
+fn logo_label(logo_state: Option<u8>) -> &'static str {
+    logo_state
+        .and_then(|s| LOGO_LABELS.get(s as usize).copied())
+        .unwrap_or("On")
+}
+
 pub struct RazerTray {
     state: SharedSensorState,
 }
@@ -316,36 +372,10 @@ impl ksni::Tray for RazerTray {
         let current_rpm = state.fan_speed.unwrap_or(0);
         let fan_min = state.fan_min;
         let fan_max = state.fan_max;
-        let range = fan_max - fan_min;
 
-        // Round to nearest 100 to match hardware granularity (clamp_fan divides by 100)
-        let pct_rpm = |p: f64| -> i32 {
-            ((fan_min as f64 + range as f64 * p) / 100.0).round() as i32 * 100
-        };
-        let presets: [(i32, &str); 5] = [
-            (0,               "Auto"),
-            (pct_rpm(0.25),   "Low"),
-            (pct_rpm(0.50),   "Medium"),
-            (pct_rpm(0.75),   "High"),
-            (fan_max,         "Max"),
-        ];
-
-        // Exact match only — no fuzzy nearest-preset selection
-        let selected: Option<usize> = presets.iter().enumerate()
-            .find(|(_, (rpm, _))| *rpm == current_rpm)
-            .map(|(i, _)| i);
-
-        // Header shows preset label if exact match, otherwise the actual calculated %
-        let current_label = match selected {
-            Some(i) => presets[i].1.to_string(),
-            None if current_rpm <= 0 => "Auto".to_string(),
-            None => {
-                let pct = if range > 0 {
-                    ((current_rpm - fan_min) as f64 / range as f64 * 100.0).round() as i32
-                } else { 0 };
-                format!("{}%", pct.clamp(0, 100))
-            }
-        };
+        let presets = fan_presets(fan_min, fan_max);
+        let selected = selected_preset_index(&presets, current_rpm);
+        let current_label = fan_current_label(&presets, selected, current_rpm, fan_min, fan_max);
         let fan_submenu_label = format!("Fan Speed  ·  {}", current_label);
 
         // Status lines
@@ -374,13 +404,7 @@ impl ksni::Tray for RazerTray {
 
         let logo_state = state.logo_state;
         let has_logo = state.has_logo;
-        const LOGO_LABELS: [&str; 3] = ["Off", "On", "Breathing"];
-        let logo_submenu_label = {
-            let label = logo_state
-                .and_then(|s| LOGO_LABELS.get(s as usize).copied())
-                .unwrap_or("On");
-            format!("Logo  ·  {}", label)
-        };
+        let logo_submenu_label = format!("Logo  ·  {}", logo_label(logo_state));
 
         let mut items: Vec<ksni::MenuItem<Self>> = vec![
             // Primary action — first
@@ -722,4 +746,82 @@ fn read_cpu_util() -> Option<u32> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn presets_for_default_range() {
+        let p = fan_presets(3500, 5000);
+        assert_eq!(p, [
+            (0,    "Auto"),
+            (3900, "Low"),
+            (4300, "Medium"),
+            (4600, "High"),
+            (5000, "Max"),
+        ]);
+    }
+
+    #[test]
+    fn presets_snap_to_100_rpm_for_awkward_ranges() {
+        for (min, max) in [(3100, 5300), (1000, 5500), (2300, 4700)] {
+            for (rpm, label) in fan_presets(min, max) {
+                assert_eq!(rpm % 100, 0,
+                    "{label} preset {rpm} for range ({min},{max}) is not a multiple of 100");
+            }
+        }
+    }
+
+    #[test]
+    fn preset_selection_is_exact_match_only() {
+        let p = fan_presets(3500, 5000);
+        assert_eq!(selected_preset_index(&p, 4300), Some(2));
+        assert_eq!(selected_preset_index(&p, 0), Some(0)); // Auto
+        assert_eq!(selected_preset_index(&p, 4000), None); // no fuzzy matching
+    }
+
+    #[test]
+    fn fan_label_uses_preset_name_on_exact_match() {
+        let p = fan_presets(3500, 5000);
+        assert_eq!(fan_current_label(&p, Some(3), 4600, 3500, 5000), "High");
+    }
+
+    #[test]
+    fn fan_label_shows_percent_for_non_preset_rpm() {
+        let p = fan_presets(3500, 5000);
+        // (4000 - 3500) / 1500 = 33.3%
+        assert_eq!(fan_current_label(&p, None, 4000, 3500, 5000), "33%");
+    }
+
+    #[test]
+    fn fan_label_percent_is_clamped_and_division_safe() {
+        let p = fan_presets(3500, 5000);
+        assert_eq!(fan_current_label(&p, None, 5400, 3500, 5000), "100%");
+        assert_eq!(fan_current_label(&p, None, 3400, 3500, 5000), "0%");
+        // degenerate range (min == max) must not divide by zero
+        assert_eq!(fan_current_label(&[], None, 4000, 4000, 4000), "0%");
+    }
+
+    #[test]
+    fn fan_label_negative_rpm_reads_auto() {
+        let p = fan_presets(3500, 5000);
+        assert_eq!(fan_current_label(&p, None, -1, 3500, 5000), "Auto");
+    }
+
+    #[test]
+    fn logo_label_maps_known_states() {
+        assert_eq!(logo_label(Some(0)), "Off");
+        assert_eq!(logo_label(Some(1)), "On");
+        assert_eq!(logo_label(Some(2)), "Breathing");
+    }
+
+    #[test]
+    fn logo_label_falls_back_to_on_for_unknown_state() {
+        // Characterizes current behavior; REVIEW_FINDINGS.md #3 proposes an
+        // explicit unknown marker here instead.
+        assert_eq!(logo_label(None), "On");
+        assert_eq!(logo_label(Some(7)), "On");
+    }
 }
