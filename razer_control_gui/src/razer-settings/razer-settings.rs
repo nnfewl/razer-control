@@ -476,19 +476,36 @@ fn get_igpu_utilization() -> Option<u32> {
     None
 }
 
-/// Read iGPU temperature from amdgpu hwmon
+/// Read iGPU temperature from hwmon (amdgpu/i915) or Intel ACPI thermal zone B0D4
 fn get_igpu_temperature() -> Option<f64> {
     if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
         for entry in entries.flatten() {
             let name_path = entry.path().join("name");
             if let Ok(name) = fs::read_to_string(&name_path) {
-                if name.trim() == "amdgpu" {
+                let name = name.trim();
+                if name == "amdgpu" || name == "i915" {
                     for temp_file in ["temp1_input", "temp2_input"] {
                         let temp_path = entry.path().join(temp_file);
                         if let Ok(content) = fs::read_to_string(&temp_path) {
                             if let Ok(temp) = content.trim().parse::<f64>() {
                                 return Some(temp / 1000.0);
                             }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Intel CometLake/IceLake: ACPI thermal zone "B0D4" is the iGPU die
+    if let Ok(zones) = fs::read_dir("/sys/class/thermal") {
+        for zone in zones.flatten() {
+            let type_path = zone.path().join("type");
+            if let Ok(t) = fs::read_to_string(&type_path) {
+                if t.trim() == "B0D4" {
+                    let temp_path = zone.path().join("temp");
+                    if let Ok(c) = fs::read_to_string(&temp_path) {
+                        if let Ok(temp) = c.trim().parse::<f64>() {
+                            return Some(temp / 1000.0);
                         }
                     }
                 }
