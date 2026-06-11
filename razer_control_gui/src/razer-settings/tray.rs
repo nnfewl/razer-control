@@ -707,8 +707,8 @@ pub(super) fn rapl_watts(
     if pe == 0 || pt == 0 || now <= pt { return None; }
     let delta_e = if energy_uj >= pe {
         energy_uj - pe
-    } else if max_range_uj > 0 {
-        (max_range_uj - pe) + energy_uj  // counter wrapped
+    } else if let Some(tail) = max_range_uj.checked_sub(pe) {
+        tail + energy_uj  // counter wrapped; pe > max_range_uj would underflow
     } else {
         return None;
     };
@@ -782,7 +782,7 @@ fn read_igpu_power() -> Option<f64> {
     None
 }
 
-fn read_mhz(path: &str) -> Option<u32> {
+pub(super) fn read_mhz(path: &str) -> Option<u32> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
@@ -1081,7 +1081,8 @@ mod tests {
         // 100_000 µJ over ~10 ms ≈ 10 W
         let w = rapl_watts(1_100_000, 0, &last_e, &last_t)
             .expect("second call with time elapsed must return watts");
-        assert!(w > 0.0, "watts must be positive, got {w}");
+        // 100_000 µJ over ~10 ms ≈ 10 W; allow 5× slack for slow CI runners
+        assert!(w > 1.0 && w < 200.0, "expected ~10 W, got {w} W");
     }
 
     #[test]
@@ -1106,6 +1107,7 @@ mod tests {
         // counter wraps: new reading is 50_000, delta_e = 50_000 + 50_000 = 100_000 µJ
         let w = rapl_watts(50_000, max, &last_e, &last_t)
             .expect("wraparound with max_range must return watts");
-        assert!(w > 0.0, "wrapped watts must be positive, got {w}");
+        // delta_e = (max - (max-50000)) + 50000 = 100_000 µJ over ~5 ms ≈ 20 W
+        assert!(w > 1.0 && w < 500.0, "expected ~20 W after wraparound, got {w} W");
     }
 }

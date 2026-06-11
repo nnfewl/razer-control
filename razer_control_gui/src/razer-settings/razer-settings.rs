@@ -355,8 +355,8 @@ fn get_system_power() -> Option<f64> {
     ];
     for path in &energy_paths {
         if fs::metadata(path).is_ok() {
-            let Ok(content) = fs::read_to_string(path) else { return None };
-            let Ok(energy) = content.trim().parse::<u64>() else { return None };
+            let Ok(content) = fs::read_to_string(path) else { continue };
+            let Ok(energy) = content.trim().parse::<u64>() else { continue };
             let max_range: u64 = fs::read_to_string(&path.replace("energy_uj", "max_energy_range_uj"))
                 .ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
             return tray::rapl_watts(energy, max_range, &LAST_E, &LAST_T);
@@ -423,6 +423,7 @@ fn get_igpu_power() -> Option<f64> {
     let paths = [
         "/sys/class/powercap/intel-rapl:0:1/energy_uj",
         "/sys/class/powercap/intel-rapl/intel-rapl:0/intel-rapl:0:1/energy_uj",
+        "/sys/class/powercap/intel-rapl-mmio:0:0/energy_uj",
     ];
     for path in &paths {
         let name_path = match std::path::Path::new(path).parent() {
@@ -432,8 +433,8 @@ fn get_igpu_power() -> Option<f64> {
         let Ok(name_content) = fs::read_to_string(&name_path) else { continue };
         if name_content.trim() != "uncore" { continue; }
         if fs::metadata(path).is_ok() {
-            let Ok(content) = fs::read_to_string(path) else { return None };
-            let Ok(energy) = content.trim().parse::<u64>() else { return None };
+            let Ok(content) = fs::read_to_string(path) else { continue };
+            let Ok(energy) = content.trim().parse::<u64>() else { continue };
             let max_range: u64 = fs::read_to_string(&path.replace("energy_uj", "max_energy_range_uj"))
                 .ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
             return tray::rapl_watts(energy, max_range, &LAST_E, &LAST_T);
@@ -445,41 +446,31 @@ fn get_igpu_power() -> Option<f64> {
 /// Read iGPU utilization (AMD gpu_busy_percent or Intel freq-based fallback)
 fn get_igpu_utilization() -> Option<u32> {
     for card in ["card0", "card1", "card2"] {
-        let busy_path = format!("/sys/class/drm/{}/device/gpu_busy_percent", card);
-        if let Ok(content) = fs::read_to_string(&busy_path) {
-            if let Ok(util) = content.trim().parse::<u32>() {
-                let driver_path = format!("/sys/class/drm/{}/device/driver", card);
-                if let Ok(driver_link) = fs::read_link(&driver_path) {
-                    if driver_link.to_string_lossy().contains("amdgpu") {
-                        return Some(util);
-                    }
+        let driver_path = format!("/sys/class/drm/{}/device/driver", card);
+        let Ok(link) = fs::read_link(&driver_path) else { continue };
+        let driver = link.to_string_lossy();
+
+        // AMD: kernel exposes gpu_busy_percent directly
+        if driver.contains("amdgpu") {
+            let busy_path = format!("/sys/class/drm/{}/device/gpu_busy_percent", card);
+            if let Ok(content) = fs::read_to_string(&busy_path) {
+                if let Ok(util) = content.trim().parse::<u32>() {
+                    return Some(util);
                 }
             }
         }
-    }
 
-    // Fallback: frequency-based estimation for Intel
-    let paths = [
-        "/sys/class/drm/card0/gt/gt0/rps_act_freq_mhz",
-        "/sys/class/drm/card1/gt/gt0/rps_act_freq_mhz",
-    ];
-    let max_paths = [
-        "/sys/class/drm/card0/gt/gt0/rps_max_freq_mhz",
-        "/sys/class/drm/card1/gt/gt0/rps_max_freq_mhz",
-    ];
-
-    for (i, path) in paths.iter().enumerate() {
-        if let Ok(act_content) = fs::read_to_string(path) {
-            if let Ok(max_content) = fs::read_to_string(&max_paths[i]) {
-                if let (Ok(act), Ok(max)) = (
-                    act_content.trim().parse::<f64>(),
-                    max_content.trim().parse::<f64>()
-                ) {
-                    if max > 0.0 {
-                        return Some(((act / max) * 100.0) as u32);
-                    }
-                }
-            }
+        // Intel: approximate utilization from active vs max frequency.
+        // Subtract RPn (idle floor) so the scale is 0% at idle, 100% at boost.
+        // act_freq ≤ RPn means the GPU is in RC6 idle → 0%.
+        if driver.contains("i915") {
+            let base = format!("/sys/class/drm/{}", card);
+            let Some(act) = tray::read_mhz(&format!("{}/gt_act_freq_mhz", base)) else { continue };
+            let Some(min) = tray::read_mhz(&format!("{}/gt_RPn_freq_mhz", base)) else { continue };
+            let Some(max) = tray::read_mhz(&format!("{}/gt_RP0_freq_mhz", base)) else { continue };
+            if max <= min { return Some(0); }
+            let pct = ((act.saturating_sub(min)) as f64 / (max - min) as f64 * 100.0) as u32;
+            return Some(pct.min(100));
         }
     }
     None
