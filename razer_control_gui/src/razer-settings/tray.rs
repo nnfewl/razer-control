@@ -445,12 +445,11 @@ impl ksni::Tray for RazerTray {
 
         // Status lines
         fn stat_line(name: &str, temp: Option<f64>, util: Option<u32>) -> Option<String> {
-            let right = match (temp, util) {
-                (Some(t), Some(u)) => format!("{:.0}°C · {}%", t, u),
-                (Some(t), None)    => format!("{:.0}°C", t),
-                _ => return None,
-            };
-            Some(format!("{}  {}", name, right))
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(t) = temp { parts.push(format!("{:.0}°C", t)); }
+            if let Some(u) = util { parts.push(format!("{}%", u)); }
+            if parts.is_empty() { return None; }
+            Some(format!("{}  {}", name, parts.join(" · ")))
         }
         let cpu_line  = stat_line("CPU",  state.cpu_temp,  state.cpu_util);
         let igpu_line = stat_line("iGPU", state.igpu_temp, state.igpu_util);
@@ -604,17 +603,35 @@ fn read_cpu_temp() -> Option<f64> {
 }
 
 fn read_igpu_temp() -> Option<f64> {
+    // AMD / newer Intel: hwmon entry named "amdgpu" or "i915"
     if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
         for entry in entries.flatten() {
             let name_path = entry.path().join("name");
             if let Ok(name) = fs::read_to_string(&name_path) {
-                if name.trim() == "amdgpu" {
+                let name = name.trim();
+                if name == "amdgpu" || name == "i915" {
                     for f in ["temp1_input", "temp2_input"] {
                         let p = entry.path().join(f);
                         if let Ok(c) = fs::read_to_string(&p) {
                             if let Ok(t) = c.trim().parse::<f64>() {
                                 return Some(t / 1000.0);
                             }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Intel CometLake/IceLake: ACPI thermal zone "B0D4" is the iGPU die
+    if let Ok(zones) = fs::read_dir("/sys/class/thermal") {
+        for zone in zones.flatten() {
+            let type_path = zone.path().join("type");
+            if let Ok(t) = fs::read_to_string(&type_path) {
+                if t.trim() == "B0D4" {
+                    let temp_path = zone.path().join("temp");
+                    if let Ok(c) = fs::read_to_string(&temp_path) {
+                        if let Ok(temp) = c.trim().parse::<f64>() {
+                            return Some(temp / 1000.0);
                         }
                     }
                 }
@@ -699,6 +716,7 @@ fn read_system_power() -> Option<f64> {
 }
 
 fn read_igpu_power() -> Option<f64> {
+    // AMD: hwmon "amdgpu" exposes instantaneous power directly
     if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
         for entry in entries.flatten() {
             let name_path = entry.path().join("name");
@@ -714,21 +732,75 @@ fn read_igpu_power() -> Option<f64> {
             }
         }
     }
+    // Intel: RAPL "uncore" domain = iGPU + LLC; closest available iGPU power source
+    let rapl_candidates = [
+        "/sys/class/powercap/intel-rapl:0:1/energy_uj",
+        "/sys/class/powercap/intel-rapl-mmio:0:0/energy_uj",
+    ];
+    for path in &rapl_candidates {
+        // Only use paths whose domain is "uncore" to avoid grabbing CPU core power
+        let name_path = match std::path::Path::new(path).parent() {
+            Some(p) => p.join("name"),
+            None => continue,
+        };
+        let Ok(name_content) = fs::read_to_string(&name_path) else { continue };
+        if name_content.trim() != "uncore" { continue; }
+        if let Ok(content) = fs::read_to_string(path) {
+            if let Ok(energy) = content.trim().parse::<u64>() {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static LAST_E: AtomicU64 = AtomicU64::new(0);
+                static LAST_T: AtomicU64 = AtomicU64::new(0);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_micros() as u64;
+                let pe = LAST_E.swap(energy, Ordering::Relaxed);
+                let pt = LAST_T.swap(now, Ordering::Relaxed);
+                if pe > 0 && pt > 0 && energy > pe {
+                    let dt = now - pt;
+                    if dt > 0 {
+                        return Some((energy - pe) as f64 / dt as f64);
+                    }
+                }
+                return None;
+            }
+        }
+    }
     None
+}
+
+fn read_mhz(path: &str) -> Option<u32> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 fn read_igpu_util() -> Option<u32> {
     for card in ["card0", "card1", "card2"] {
-        let busy_path = format!("/sys/class/drm/{}/device/gpu_busy_percent", card);
-        if let Ok(content) = fs::read_to_string(&busy_path) {
-            if let Ok(util) = content.trim().parse::<u32>() {
-                let driver_path = format!("/sys/class/drm/{}/device/driver", card);
-                if let Ok(link) = fs::read_link(&driver_path) {
-                    if link.to_string_lossy().contains("amdgpu") {
-                        return Some(util);
-                    }
+        let driver_path = format!("/sys/class/drm/{}/device/driver", card);
+        let Ok(link) = fs::read_link(&driver_path) else { continue };
+        let driver = link.to_string_lossy();
+
+        // AMD: kernel exposes gpu_busy_percent directly
+        if driver.contains("amdgpu") {
+            let busy_path = format!("/sys/class/drm/{}/device/gpu_busy_percent", card);
+            if let Ok(content) = fs::read_to_string(&busy_path) {
+                if let Ok(util) = content.trim().parse::<u32>() {
+                    return Some(util);
                 }
             }
+        }
+
+        // Intel: approximate utilization from active vs max frequency.
+        // act_freq ≤ RPn means the GPU is in RC6 idle → 0%.
+        if driver.contains("i915") {
+            let base = format!("/sys/class/drm/{}", card);
+            let Some(act) = read_mhz(&format!("{}/gt_act_freq_mhz", base)) else { continue };
+            let Some(min) = read_mhz(&format!("{}/gt_RPn_freq_mhz", base)) else { continue };
+            let Some(max) = read_mhz(&format!("{}/gt_RP0_freq_mhz", base)) else { continue };
+            if max <= min {
+                return Some(0);
+            }
+            let pct = ((act.saturating_sub(min)) as f64 / (max - min) as f64 * 100.0) as u32;
+            return Some(pct.min(100));
         }
     }
     None
